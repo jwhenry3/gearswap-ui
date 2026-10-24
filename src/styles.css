@@ -1,0 +1,78 @@
+@import "tailwindcss";
+
+/* shadcn-style theme tokens mapped onto the app's slate palette */
+:root {
+  --background: #020617;
+  --foreground: #e2e8f0;
+  --card: #0f172a;
+  --card-foreground: #e2e8f0;
+  --popover: #0f172a;
+  --popover-foreground: #e2e8f0;
+  --primary: #38bdf8;
+  --primary-foreground: #082f49;
+  --secondary: #1e293b;
+  --secondary-foreground: #e2e8f0;
+  --muted: #1e293b;
+  --muted-foreground: #94a3b8;
+  --accent: #1e293b;
+  --accent-foreground: #f1f5f9;
+  --destructive: #f43f5e;
+  --destructive-foreground: #fff1f2;
+  --border: #334155;
+  --input: #334155;
+  --ring: #38bdf8;
+  --radius: 0.5rem;
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --radius-lg: var(--radius);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-sm: calc(var(--radius) - 4px);
+}
+
+body {
+  background-color: var(--background);
+  color: var(--foreground);
+}
+
+.nav-link {
+  opacity: 0.6;
+  color: inherit;
+  text-decoration: none;
+}
+.nav-link.active {
+  opacity: 1;
+  font-weight: 600;
+}
+
+/* frameless overlay drag region — Wails reads --wails-draggable natively;
+   the Electron dev shell injects the -webkit-app-region equivalent */
+header {
+  --wails-draggable: drag;
+}
+header a,
+header button,
+header input,
+header select,
+header .nav-link {
+  --wails-draggable: no-drag;
+}
