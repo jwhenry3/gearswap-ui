@@ -20,6 +20,17 @@ prefers the bundled exe and falls back to the Electron dev launcher.
   `equip <set>`.
 - `swapui.lua` — headless GearSwap profile scanner powering `//gsui equip`,
   `swap list/add/remove/scan`. No UI.
+- `macros.lua` — FFXI macro file r/w under `<ffxi>/USER/<content id>/`:
+  `mcr.dat`+`mcrN.dat` palettes (28B hdr + 20 × `6×61B lines + 8B name`),
+  `mcr.ttl`/`mcr_2.ttl` book titles (24B hdr + 20×16B, books 1-40), index i →
+  book `i/10+1` page `i%10+1`. Header embeds md5 of bytes 24+; writes
+  recompute it (pure-Lua md5, `bit` or 5.3 natives) and leave `*.gsui-bak`.
+  Auto-translate `FD…FD` phrases ↔ `[AT:xxxxxxxx]`, other bytes ↔ `\xNN`.
+  `GET /api/macros`, `PUT /api/macros/palette[?apply=1]`,
+  `PUT /api/macros/title`. **apply confirmed live**: `input /macro book N`
+  forces the client to re-read that book's files from disk — the endpoint
+  switches away (≥1.5s, PR #1892's wipe threshold), writes while the book
+  is unloaded, switches back, then `/macro set` the page.
 - `icon_extractor.lua` — decodes FFXI DAT item icons to BMP.
 - `ui/` — vite build output; deploy copies `addon/gearswapui/` to
   `windower/addons/gearswapui/` (keep in sync; `data/` there is live state).
@@ -37,6 +48,9 @@ prefers the bundled exe and falls back to the Electron dev launcher.
   panel, slot/bag/text-filtered item picker, detail panel.
 - `inventory/inventory.view.tsx`, `files/files.view.tsx` — bag/slot filters,
   icons, detail panel; file browser/editor.
+- `macros/macros.view.tsx` — macro editor: char/book/page pickers, Ctrl/Alt
+  2×10 grid, label + 6 line editor with byte counters, copy/paste palette,
+  book rename, "save & apply" while logged in.
 - `core/addon-api.service.ts` — same-origin API client (state SSE, files,
   `sendCommand`, `iconUrl`, `reloadGearswap`); `VITE_GSUI_API` for dev.
 - `core/host.ts` — shell shim: `host.hide()`/`host.quit()` call the Wails
