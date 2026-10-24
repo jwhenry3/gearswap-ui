@@ -4,11 +4,16 @@
 // process just finds it (probing 127.0.0.1:17890..17899 for /api/status,
 // or $GSUI_PORT if set) and shows it in a frameless always-on-top window.
 //
-// Window chrome on the navigated page works through Wails' own message
-// channel — Wails v3 routes "wails:drag" / "wails:resize:<cursor>" from any
-// main-frame origin, so the page posts those raw strings via
-// chrome.webview.postMessage. "gsui:hide" / "gsui:quit" land in
-// RawMessageHandler. No runtime injection needed.
+// The window has two modes:
+//
+//	fab  — a small always-on-top floating button (--fab starts this way).
+//	       The addon spawns it on load; it survives //gsui hide/close/Esc.
+//	full — the whole GearSwap UI.
+//
+// The page itself decides what to render from the viewport size, and talks
+// to the shell through Wails' raw message channel — "wails:drag" /
+// "wails:resize:<cursor>" are routed from any main-frame origin, while
+// "gsui:expand|collapse|quit" land in RawMessageHandler.
 //
 // Build:
 //
@@ -17,12 +22,14 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -32,6 +39,13 @@ import (
 )
 
 const windowTitle = "GearSwap UI"
+
+const (
+	fabSize       = 56
+	fullW, fullH  = 1100, 760
+	minW, minH    = 860, 520
+	fabEdgeMargin = 24
+)
 
 // ---------------------------------------------------------------- win32
 
@@ -44,6 +58,7 @@ var (
 	pSetForegroundWindow = user32.NewProc("SetForegroundWindow")
 	pGetForegroundWindow = user32.NewProc("GetForegroundWindow")
 	pSetWindowPos        = user32.NewProc("SetWindowPos")
+	pGetSystemMetrics    = user32.NewProc("GetSystemMetrics")
 )
 
 const (
@@ -73,6 +88,12 @@ func foreground() uintptr {
 	return r
 }
 
+func screenSize() (int, int) {
+	cx, _, _ := pGetSystemMetrics.Call(0) // SM_CXSCREEN
+	cy, _, _ := pGetSystemMetrics.Call(1) // SM_CYSCREEN
+	return int(cx), int(cy)
+}
+
 // keepPinned re-asserts topmost z-order and un-minimizes — frameless
 // tool windows get buried by the game asserting its own topmost, and
 // auto-minimized when the game takes focus. Skips re-pinning while our
@@ -90,7 +111,7 @@ func keepPinned(win *application.WebviewWindow) {
 	for {
 		time.Sleep(2 * time.Second)
 		if !isVisible(hwnd) {
-			continue // hidden via Esc
+			continue
 		}
 		if isIconic(hwnd) {
 			pShowWindow.Call(hwnd, swRestore)
@@ -102,6 +123,38 @@ func keepPinned(win *application.WebviewWindow) {
 		pSetWindowPos.Call(hwnd, hwndTopmost, 0, 0, 0, 0,
 			swpNoMove|swpNoSize|swpNoActivate|swpShowWindow)
 	}
+}
+
+// --------------------------------------------------------- geometry state
+
+type rect struct{ X, Y, W, H int }
+
+type geometry struct {
+	Fab  *rect `json:"fab,omitempty"`
+	Full *rect `json:"full,omitempty"`
+}
+
+var geom geometry
+var geomPath string
+
+func loadGeometry() {
+	b, err := os.ReadFile(geomPath)
+	if err == nil {
+		json.Unmarshal(b, &geom)
+	}
+}
+
+func saveGeometry() {
+	if b, err := json.Marshal(geom); err == nil {
+		os.WriteFile(geomPath, b, 0o644)
+	}
+}
+
+// defaultFabPos parks the button in the bottom-right corner of the
+// primary monitor.
+func defaultFabPos() (int, int) {
+	cx, cy := screenSize()
+	return cx - fabSize - fabEdgeMargin, cy - fabSize - fabEdgeMargin
 }
 
 // ---------------------------------------------------------- port probing
@@ -139,7 +192,7 @@ const splashHTML = `<!doctype html>
     font:14px system-ui;display:grid;place-items:center}
   .spin{color:#38bdf8}
 </style>
-<p>connecting to the gearswapui addon<span class="spin">…</span></p>
+<p>connecting<span class="spin">…</span></p>
 `
 
 func dataDir() string {
@@ -152,7 +205,82 @@ func dataDir() string {
 	return d
 }
 
+// --------------------------------------------------------------- modes
+
+var (
+	win     *application.WebviewWindow
+	app     *application.App
+	fabMode bool
+)
+
+// expand grows the fab back into the full window, restoring the bounds it
+// had when it collapsed (or a centered default the first time).
+func expand() {
+	if !fabMode {
+		return
+	}
+	log.Printf("expand: fab=%v", geom.Fab)
+	x, y := win.Position()
+	geom.Fab = &rect{X: x, Y: y, W: fabSize, H: fabSize}
+	fabMode = false
+
+	win.SetResizable(true)
+	if r := geom.Full; r != nil && r.W >= minW && r.H >= minH {
+		win.SetSize(r.W, r.H)
+		win.SetPosition(r.X, r.Y)
+	} else {
+		win.SetSize(fullW, fullH)
+		win.Center()
+	}
+	win.SetMinSize(minW, minH)
+	win.Show()
+	win.Focus()
+	saveGeometry()
+}
+
+// collapse shrinks the window back to the fab, remembering the full
+// bounds so expand can restore them.
+func collapse() {
+	if fabMode {
+		return
+	}
+	fx, fy := win.Position()
+	fw, fh := win.Size()
+	geom.Full = &rect{X: fx, Y: fy, W: fw, H: fh}
+	fabMode = true
+
+	win.SetMinSize(fabSize, fabSize)
+	win.SetSize(fabSize, fabSize)
+	win.SetResizable(false)
+	if geom.Fab != nil {
+		win.SetPosition(geom.Fab.X, geom.Fab.Y)
+	} else {
+		x, y := defaultFabPos()
+		win.SetPosition(x, y)
+	}
+	saveGeometry()
+}
+
+func quit() {
+	// persist whichever geometry is live so the next launch restores it
+	if fabMode {
+		x, y := win.Position()
+		geom.Fab = &rect{X: x, Y: y, W: fabSize, H: fabSize}
+	} else {
+		fx, fy := win.Position()
+		fw, fh := win.Size()
+		geom.Full = &rect{X: fx, Y: fy, W: fw, H: fh}
+	}
+	saveGeometry()
+	app.Quit()
+}
+
 func main() {
+	startFab := slices.Contains(os.Args[1:], "--fab")
+
+	geomPath = filepath.Join(dataDir(), "window.json")
+	loadGeometry()
+
 	logf, err := os.OpenFile(filepath.Join(dataDir(), "overlay.log"),
 		os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
 	if err == nil {
@@ -160,36 +288,47 @@ func main() {
 		defer logf.Close()
 	}
 
-	var win *application.WebviewWindow
-	var app *application.App
 	app = application.New(application.Options{
 		Name: "gearswapui-overlay",
-		// //gsui overlay can fire repeatedly — surface the existing window
-		// instead of stacking instances.
+		// //gsui overlay (and the addon's auto-fab spawn on load) can fire
+		// repeatedly — surface the existing window instead of stacking.
+		// A plain relaunch expands the UI; a --fab relaunch (addon reload)
+		// just makes sure the button is visible.
 		SingleInstance: &application.SingleInstanceOptions{
 			UniqueID: "com.gearswapui.overlay",
 			OnSecondInstanceLaunch: func(data application.SecondInstanceData) {
+				log.Printf("second instance: args=%v", data.Args)
 				if win == nil {
 					return
 				}
-				win.Show()
-				win.Focus()
-				if hwnd := windowHwnd.Load(); hwnd != 0 {
-					if isIconic(hwnd) {
-						pShowWindow.Call(hwnd, swRestore)
+				go func() {
+					if !slices.Contains(data.Args, "--fab") {
+						expand()
 					}
-					pSetForegroundWindow.Call(hwnd)
-				}
+					win.Show()
+					win.Focus()
+					if hwnd := windowHwnd.Load(); hwnd != 0 {
+						if isIconic(hwnd) {
+							pShowWindow.Call(hwnd, swRestore)
+						}
+						pSetForegroundWindow.Call(hwnd)
+					}
+				}()
 			},
 		},
 		// the page is a foreign-origin document — Wails' own "wails:*"
-		// messages reach HandleMessage directly, anything else lands here
+		// messages reach HandleMessage directly, anything else lands here.
+		// win methods go through InvokeSync internally, so they must run
+		// off the main thread that invokes this handler — hence the gos.
 		RawMessageHandler: func(w application.Window, message string, _ *application.OriginInfo) {
+			log.Printf("page message: %q", message)
 			switch message {
-			case "gsui:hide":
-				win.Hide()
+			case "gsui:expand":
+				go expand()
+			case "gsui:collapse", "gsui:hide":
+				go collapse()
 			case "gsui:quit":
-				app.Quit()
+				go quit()
 			}
 		},
 		Windows: application.WindowsOptions{
@@ -198,21 +337,39 @@ func main() {
 		},
 	})
 
-	win = app.Window.NewWithOptions(application.WebviewWindowOptions{
-		Title:            windowTitle,
-		Width:            1100,
-		Height:           760,
-		MinWidth:         860,
-		MinHeight:        520,
-		Frameless:        true,
-		AlwaysOnTop:      true,
+	opts := application.WebviewWindowOptions{
+		Title:       windowTitle,
+		Frameless:   true,
+		AlwaysOnTop: true,
+		// transparent so the fab's square window reads as a circle —
+		// the full page paints its own opaque background
+		BackgroundType:   application.BackgroundTypeTransparent,
 		BackgroundColour: application.NewRGB(2, 6, 23), // --background #020617
 		HTML:             splashHTML,
 		Windows: application.WindowsWindow{
 			HiddenOnTaskbar:                   true,
 			DisableFramelessWindowDecorations: true,
 		},
-	})
+	}
+	if startFab {
+		fabMode = true
+		x, y := defaultFabPos()
+		if geom.Fab != nil {
+			x, y = geom.Fab.X, geom.Fab.Y
+		}
+		opts.Width, opts.Height = fabSize, fabSize
+		opts.MinWidth, opts.MinHeight = fabSize, fabSize
+		opts.X, opts.Y = x, y
+		opts.DisableResize = true
+	} else {
+		opts.Width, opts.Height = fullW, fullH
+		opts.MinWidth, opts.MinHeight = minW, minH
+		if geom.Full != nil && geom.Full.W >= minW && geom.Full.H >= minH {
+			opts.Width, opts.Height = geom.Full.W, geom.Full.H
+			opts.X, opts.Y = geom.Full.X, geom.Full.Y
+		}
+	}
+	win = app.Window.NewWithOptions(opts)
 
 	// frameless+tool windows auto-minimize when the game takes focus — undo it
 	win.OnWindowEvent(events.Common.WindowMinimise, func(e *application.WindowEvent) {

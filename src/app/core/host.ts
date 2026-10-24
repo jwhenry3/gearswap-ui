@@ -1,14 +1,18 @@
 // Host-shell abstraction: the UI runs inside either the Wails v3 overlay
 // (distributed build) or the Electron overlay (dev) / a plain browser.
 //
-// The app page is a *foreign* document to Wails (loaded from the addon's
-// own HTTP server), but Wails v3 routes window-chrome messages from any
-// main-frame origin — so the page speaks to the shell directly through
-// WebView2's chrome.webview.postMessage with raw strings:
+// The overlay window has two modes — a tiny floating button ("fab") and
+// the full UI. The page picks which to render from the viewport size
+// (fabMode signal) and talks to the shell through WebView2's
+// chrome.webview.postMessage with raw strings:
 //
 //   "wails:drag"                → native caption move loop
 //   "wails:resize:<cursor>"     → native size loop (se-resize, nw-resize…)
-//   "gsui:hide" / "gsui:quit"   → app-level, handled by RawMessageHandler
+//   "gsui:expand"               → fab → full window
+//   "gsui:collapse"             → full → fab (Esc/× both collapse now)
+//   "gsui:quit"                 → exit the overlay process
+import { signal } from '@preact/signals';
+
 interface Webview2Host {
   postMessage(msg: unknown): void;
 }
@@ -26,17 +30,44 @@ const inWebView = () => !!window.chrome?.webview;
 
 const tell = (msg: string) => window.chrome?.webview?.postMessage(msg);
 
+// A viewport this small means the shell is in fab mode — the app renders
+// just the button. Gated on inWebView so shrinking a dev browser tab
+// doesn't collapse the UI.
+const FAB_VIEWPORT = 200;
+export const fabMode = signal(false);
+
+const updateFabMode = () => {
+  fabMode.value =
+    inWebView() &&
+    window.innerWidth < FAB_VIEWPORT &&
+    window.innerHeight < FAB_VIEWPORT;
+  // body paints the opaque app background — drop it in fab mode so the
+  // window's transparent backdrop shows through around the circle
+  document.body.classList.toggle('fab-mode', fabMode.value);
+};
+
 export const host = {
   /** true when running inside a native WebView2 shell */
   inShell: inWebView,
 
-  /** Esc — hide the window (re-shown by //gsui overlay) */
-  hide() {
-    if (inWebView()) tell('gsui:hide');
+  /** start the native caption-move loop (fab drag, fallback for header) */
+  drag() {
+    tell('wails:drag');
+  },
+
+  /** fab → full window */
+  expand() {
+    tell('gsui:expand');
+  },
+
+  /** full → fab. Esc and the × button both collapse — the fab is the
+   *  persistent "closed" state unless the addon is unloaded. */
+  collapse() {
+    if (inWebView()) tell('gsui:collapse');
     else window.close();
   },
 
-  /** header × button — quit the overlay process entirely */
+  /** quit the overlay process entirely (fab right-click) */
   quit() {
     if (inWebView()) tell('gsui:quit');
     else window.close();
@@ -63,16 +94,19 @@ function edgeAt(x: number, y: number): string | null {
   return null;
 }
 
-// Wires the frameless chrome affordances for the wails shell:
+// Wires the frameless chrome affordances for the wails shell (full mode
+// only — the fab handles its own drag/click):
 //  - edges: mousemove shows the resize cursor; mousedown starts a native
 //    size loop via "wails:resize:<cursor>"
 //  - drag: mousedown on a --wails-draggable:drag element (honoring
 //    no-drag) starts a native caption move via "wails:drag"
 export function installWindowChrome() {
   if (!inWebView()) return;
+  updateFabMode();
+  window.addEventListener('resize', updateFabMode);
 
   document.addEventListener('mousemove', (e) => {
-    if (e.buttons !== 0) return; // don't churn cursors mid-drag
+    if (e.buttons !== 0 || fabMode.value) return; // no churn mid-drag / no edges on the fab
     const cursor = edgeAt(e.clientX, e.clientY) ?? '';
     if (document.documentElement.style.cursor !== cursor) {
       document.documentElement.style.cursor = cursor;
@@ -82,7 +116,7 @@ export function installWindowChrome() {
   document.addEventListener(
     'mousedown',
     (e) => {
-      if (e.button !== 0) return;
+      if (e.button !== 0 || fabMode.value) return;
       const edge = edgeAt(e.clientX, e.clientY);
       if (edge) {
         e.preventDefault();

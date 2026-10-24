@@ -55,14 +55,24 @@ prefers the bundled exe and falls back to the Electron dev launcher.
   `Windows.HiddenOnTaskbar` keeps it out of the taskbar/alt-tab.
   `keepPinned` goroutine re-asserts `HWND_TOPMOST` every 2s (skipped while
   focused, same as Electron), and `WindowMinimise` → `Show()` undoes the
-  frameless auto-minimize quirk. Chrome on the foreign-origin page works
+  frameless auto-minimize quirk. The window has two modes: a 56px
+  transparent **fab** (`--fab` arg; the addon auto-spawns it on load,
+  `settings.fab`, `//gsui fab on|off`) and the full UI.
+  `expand()`/`collapse()` swap min-size/resizable/bounds; both geometries
+  persist in `%LOCALAPPDATA%/gearswapui/window.json`. The page picks what
+  to render from viewport size (`fabMode` signal in host.ts);
+  `body.fab-mode` drops the opaque background so the button reads
+  circular — `BackgroundType: BackgroundTypeTransparent` makes the
+  WebView2 backdrop transparent. Chrome on the foreign-origin page works
   through Wails' raw message channel — v3 routes `wails:drag` /
   `wails:resize:<cursor>` from any main-frame origin (unlike v2's
-  origin-gated bindings), and `gsui:hide`/`gsui:quit` land in
-  `RawMessageHandler`; `src/app/core/host.ts` posts them via
-  `chrome.webview.postMessage`. Drag region: `--wails-draggable` in
-  `src/styles.css`; edge-resize cursors/zones are detected in-page (8px
-  border) since `WM_NCHITTEST` never reaches the webview child window.
+  origin-gated bindings), and `gsui:expand`/`gsui:collapse`/`gsui:quit`
+  land in `RawMessageHandler`; `src/app/core/host.ts` posts them via
+  `chrome.webview.postMessage`. Esc and × collapse to the fab; only
+  `//lua unload` (taskkill) or fab right-click quits the process.
+  Drag region: `--wails-draggable` in `src/styles.css`; edge-resize
+  cursors/zones are detected in-page (8px border, fab mode excluded)
+  since `WM_NCHITTEST` never reaches the webview child window.
   Logs to `%LOCALAPPDATA%/gearswapui/overlay.log`; WebView2 UDF at
   `%LOCALAPPDATA%/gearswapui/webview2`.
 - `launch.mjs` — dev path: spawns Electron detached, strips

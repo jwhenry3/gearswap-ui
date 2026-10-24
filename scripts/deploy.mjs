@@ -2,7 +2,7 @@
 // Windower install at ../addons/gearswapui. The live dir's data/ folder
 // (settings + icon cache) is never touched.
 //   node scripts/deploy.mjs [target-dir]
-import { cpSync, existsSync, readdirSync, rmSync } from 'node:fs';
+import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -26,8 +26,33 @@ if (existsSync(assets)) {
   }
 }
 
-cpSync(src, dst, {
-  recursive: true,
-  filter: (s) => s !== path.join(src, 'data'),
-});
-console.log(`deployed addon/gearswapui -> ${dst}`);
+// copy file-by-file, skipping unchanged content — gsui-overlay.exe stays
+// locked while running and must not be rewritten anyway
+const skip = new Set([path.join(src, 'data')]);
+let copied = 0;
+let locked = 0;
+function sync(s, d) {
+  if (skip.has(s)) return;
+  if (statSync(s).isDirectory()) {
+    mkdirSync(d, { recursive: true });
+    for (const f of readdirSync(s)) sync(path.join(s, f), path.join(d, f));
+    return;
+  }
+  if (existsSync(d)) {
+    try {
+      const a = readFileSync(s);
+      const b = readFileSync(d);
+      if (a.equals(b)) return;
+    } catch { /* unreadable dest — try the copy anyway */ }
+  }
+  try {
+    copyFileSync(s, d);
+    copied++;
+  } catch (e) {
+    // file locked (running exe) — leave the existing one in place
+    locked++;
+    console.warn(`skipped locked ${path.relative(src, s)}`);
+  }
+}
+sync(src, dst);
+console.log(`deployed addon/gearswapui -> ${dst} (${copied} updated${locked ? `, ${locked} locked` : ''})`);

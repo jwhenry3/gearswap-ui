@@ -3,6 +3,8 @@ import type {
   InventoryState,
   GearswapFileList,
   GearswapFileContent,
+  MacroState,
+  MacroEntry,
 } from './types';
 
 // In production the addon serves this UI itself, so same-origin is correct.
@@ -115,5 +117,51 @@ export class AddonApi {
   /** item icon (extracted bmp served by the addon); 404s until extracted */
   iconUrl(id: number): string {
     return `${API_BASE}/api/icon?id=${id}`;
+  }
+
+  // ---------- FFXI macro files ----------
+
+  readonly macros = signal<MacroState | null>(null);
+
+  async refreshMacros() {
+    this.macros.value = await req<MacroState>('/api/macros');
+  }
+
+  /** write one palette page (20 macros) to mcr<index>.dat.
+   *  apply=true asks the addon to force the client to re-read the book:
+   *  it switches the client to another book, writes the file while the
+   *  book is unloaded, then switches back and selects the page. */
+  async savePalette(
+    char: string,
+    index: number,
+    macros: MacroEntry[],
+    apply = false,
+  ) {
+    const res = await req<{
+      ok: boolean;
+      file: string;
+      applied?: boolean;
+      logged_in: boolean;
+    }>(`/api/macros/palette${apply ? '?apply=1' : ''}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ char, index, macros }),
+    });
+    void this.refreshMacros();
+    return res;
+  }
+
+  /** rename a macro book title (book 1-40) */
+  async saveMacroTitle(char: string, book: number, title: string) {
+    const res = await req<{ ok: boolean; logged_in: boolean }>(
+      '/api/macros/title',
+      {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ char, book, title }),
+      },
+    );
+    void this.refreshMacros();
+    return res;
   }
 }

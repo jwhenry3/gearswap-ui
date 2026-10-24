@@ -1,10 +1,12 @@
 import { Component, View, inject, RouterOutlet, Link, Router } from '@preact-mvc/core';
 import { APP_TITLE } from './core/tokens';
 import { AddonApi } from './core/addon-api.service';
-import { host } from './core/host';
+import { host, fabMode } from './core/host';
+import { Fab } from './fab';
 
 const NAV = [
   { to: '/', match: '/', label: 'Inventory' },
+  { to: '/macros', match: '/macros', label: 'Macros' },
   { to: '/profile', match: '/profile', label: 'Profile' },
 ];
 
@@ -15,6 +17,9 @@ export class AppShell extends View {
   private title = inject(APP_TITLE);
 
   render() {
+    // the shell is in fab mode — just the floating button
+    if (fabMode.value) return <Fab />;
+
     const url = this.router.url.value;
     const player = this.api.state.value?.player;
     const connected = this.api.connected.value;
@@ -49,8 +54,8 @@ export class AppShell extends View {
           />
           <button
             class="ml-1 flex h-6 w-6 items-center justify-center rounded text-sm leading-none text-slate-500 hover:bg-slate-800 hover:text-rose-300"
-            title="close (Esc hides the overlay instead)"
-            onClick={() => host.quit()}
+            title="collapse to the floating button (Esc does the same)"
+            onClick={() => host.collapse()}
           >
             ×
           </button>

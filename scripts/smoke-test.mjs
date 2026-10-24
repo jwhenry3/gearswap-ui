@@ -42,6 +42,56 @@ const WAR_LUA = [
 ].join('\n') + '\n';
 writeFileSync(join(gsData, 'Tester', 'WAR.lua'), WAR_LUA);
 
+// Fake FFXI install with a USER/<content id> macro dir. Fixtures are built
+// in the real on-disk format (verified against retail files):
+//   24B header (u32 ver + u32 field + md5 of bytes 24+) + 4B zero gap
+//   + 20 records x (6 x 61B lines + 8B name + pad) — last record 2B pad
+//   mcr.ttl: 24B header + 20 x 16B book titles
+const crypto = await import('node:crypto');
+const ffxiDir = join(fakeRoot, 'ffxi');
+const macroDir = join(ffxiDir, 'USER', 'deadbee');
+mkdirSync(macroDir, { recursive: true });
+const MD5_OFF = 24;
+const mcrHdr = (body) =>
+  Buffer.concat([
+    Buffer.from([1, 0, 0, 0, 0x7e, 0x3b, 0xb7, 0x44]),
+    crypto.createHash('md5').update(body).digest(),
+  ]);
+function buildPalette(macros) {
+  const parts = [Buffer.alloc(4)]; // zero gap after the md5
+  for (let i = 0; i < 20; i++) {
+    const m = macros[i] ?? {};
+    for (let j = 0; j < 6; j++) {
+      const b = Buffer.alloc(61);
+      b.write(String(m.lines?.[j] ?? '').slice(0, 60), 'latin1');
+      parts.push(b);
+    }
+    const nb = Buffer.alloc(8);
+    nb.write(String(m.name ?? '').slice(0, 8), 'latin1');
+    parts.push(nb, Buffer.alloc(i < 19 ? 6 : 2));
+  }
+  const body = Buffer.concat(parts);
+  return Buffer.concat([mcrHdr(body), body]);
+}
+function buildTitles(titles) {
+  const parts = [];
+  for (let i = 0; i < 20; i++) {
+    const t = Buffer.alloc(16);
+    t.write(String(titles[i] ?? `Book ${i + 1}`).slice(0, 16), 'latin1');
+    parts.push(t);
+  }
+  const body = Buffer.concat(parts);
+  return Buffer.concat([mcrHdr(body), body]);
+}
+writeFileSync(join(macroDir, 'mcr.dat'), buildPalette([
+  { name: 'TestMcr', lines: ['/say hello', '', '', '', '', ''] },
+  { name: 'AT', lines: ['\xfd\x02\x02\x12\x34\xfd rest', '', '', '', '', ''] },
+]));
+writeFileSync(join(macroDir, 'mcr10.dat'), buildPalette([
+  { name: 'Stone', lines: ['/console stone', '', '', '', '', ''] },
+]));
+writeFileSync(join(macroDir, 'mcr.ttl'), buildTitles(['Book 1', 'RDM']));
+
 const L = lauxlib.luaL_newstate();
 lualib.luaL_openlibs(L);
 
@@ -241,10 +291,14 @@ const bags = {
 // Bag id -> windower.ffxi bag key, mirroring the addon's BAGS table.
 const BAG_KEYS = { 0: 'inventory', 1: 'safe', 8: 'wardrobe' };
 
+let loggedIn = false;
+
 const windower = {
   addon_path: addonDir + '\\',
   windower_path: fakeRoot + '\\',
+  ffxi_path: ffxiDir + '\\',
   ffxi: {
+    get_info: fn(() => ({ logged_in: loggedIn })),
     get_player: fn(() => ({
       name: 'Tester', main_job_id: 1, main_job_level: 99,
       sub_job_id: 13, sub_job_level: 49,
@@ -415,6 +469,13 @@ package.loaded['config'] = {
 lua.lua_settop(L, 0); // clear any stub leftovers before loading the addon
 lua.lua_settop(L, 0); // clear any stub leftovers before loading the addon
 
+// package.path += <addon>/? so sibling modules (macros.lua) resolve the
+// same way Windower resolves them for a loaded addon.
+lauxlib.luaL_dostring(
+  L,
+  to_luastring(`package.path = package.path .. ';${addonDir.replace(/\\/g, '/')}/?.lua'`),
+);
+
 const rc = lauxlib.luaL_dofile(L, to_luastring(addonFile));
 if (rc !== LUA_OK) {
   console.error('addon load failed:', to_jsstring(lauxlib.luaL_tolstring(L, -1, null)));
@@ -564,6 +625,141 @@ await step(5);
   assert.equal((await p).ok, true);
   assert.ok(commands.includes('gs reload'));
   console.log('PASS /api/gearswap/reload');
+}
+
+// macro files: GET parses mcr.dat/mcr.ttl, PUT writes valid images
+{
+  const p = fetch(`${base}/api/macros`).then((r) => r.json());
+  await step(5);
+  const j = await p;
+  assert.equal(j.logged_in, false);
+  assert.equal(j.characters.length, 1);
+  const ch = j.characters[0];
+  assert.equal(ch.id, 'deadbee');
+  assert.equal(ch.titles[1], 'RDM');
+  assert.equal(ch.palettes.length, 2);
+  const pal0 = ch.palettes.find((x) => x.index === 0);
+  assert.equal(pal0.book, 1);
+  assert.equal(pal0.palette, 1);
+  assert.equal(pal0.macros.length, 20);
+  assert.equal(pal0.macros[0].name, 'TestMcr');
+  assert.equal(pal0.macros[0].lines[0], '/say hello');
+  // raw 0xFD auto-translate bytes decode to the editable token form
+  assert.equal(pal0.macros[1].lines[0], '[AT:02021234] rest');
+  const pal10 = ch.palettes.find((x) => x.index === 10);
+  assert.equal(pal10.book, 2);
+  assert.equal(pal10.palette, 1);
+  console.log('PASS GET /api/macros');
+
+  // PUT a rewritten palette back to mcr10.dat
+  const out = Array.from({ length: 20 }, () => ({ name: '', lines: ['', '', '', '', '', ''] }));
+  out[0] = { name: 'New', lines: ['/ja Provoke <t>', '', '', '', '', ''] };
+  out[19] = { name: 'Last', lines: ['/p end', '', '', '', '', ''] };
+  const p2 = fetch(`${base}/api/macros/palette`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ char: 'deadbee', index: 10, macros: out }),
+  }).then((r) => r.json());
+  await step(5);
+  const j2 = await p2;
+  assert.equal(j2.ok, true);
+  assert.equal(j2.file, 'mcr10.dat');
+  // validate the written image: correct md5 + record layout
+  const img = readFileSync(join(macroDir, 'mcr10.dat'));
+  assert.equal(img.length, 7624);
+  const body = img.subarray(MD5_OFF);
+  assert.equal(
+    crypto.createHash('md5').update(body).digest('hex'),
+    img.subarray(8, 24).toString('hex'),
+    'written file md5 mismatch',
+  );
+  // record 0: lines at 28.., name after 6*61
+  assert.equal(img.subarray(28, 28 + 16).toString('latin1').replace(/\0+$/, ''), '/ja Provoke <t>');
+  const nameOff = 28 + 6 * 61;
+  assert.equal(img.subarray(nameOff, nameOff + 8).toString('latin1').replace(/\0+$/, ''), 'New');
+  // record 19 name sits at 28 + 19*380 + 366
+  const last = 28 + 19 * 380 + 366;
+  assert.equal(img.subarray(last, last + 8).toString('latin1').replace(/\0+$/, ''), 'Last');
+  assert.ok(existsSync(join(macroDir, 'mcr10.dat.gsui-bak')), 'no backup written');
+  console.log('PASS PUT /api/macros/palette');
+
+  // PUT to a brand-new palette index creates mcr20.dat
+  const p3 = fetch(`${base}/api/macros/palette`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      char: 'deadbee', index: 20,
+      macros: Array.from({ length: 20 }, () => ({ name: '', lines: [] })),
+    }),
+  }).then((r) => r.json());
+  await step(5);
+  assert.equal((await p3).ok, true);
+  const img20 = readFileSync(join(macroDir, 'mcr20.dat'));
+  assert.equal(img20.length, 7624);
+  assert.equal(
+    crypto.createHash('md5').update(img20.subarray(MD5_OFF)).digest('hex'),
+    img20.subarray(8, 24).toString('hex'),
+  );
+  console.log('PASS create new palette file');
+
+  // PUT a book title rewrites mcr.ttl with a fresh md5
+  const p4 = fetch(`${base}/api/macros/title`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ char: 'deadbee', book: 2, title: 'MNK' }),
+  }).then((r) => r.json());
+  await step(5);
+  assert.equal((await p4).ok, true);
+  const ttl = readFileSync(join(macroDir, 'mcr.ttl'));
+  assert.equal(ttl.length, 344);
+  assert.equal(
+    crypto.createHash('md5').update(ttl.subarray(MD5_OFF)).digest('hex'),
+    ttl.subarray(8, 24).toString('hex'),
+  );
+  assert.equal(ttl.subarray(24 + 16, 24 + 32).toString('latin1').replace(/\0+$/, ''), 'MNK');
+  console.log('PASS PUT /api/macros/title');
+
+  // GET reflects the written title + palette
+  const p5 = fetch(`${base}/api/macros`).then((r) => r.json());
+  await step(5);
+  const j5 = await p5;
+  assert.equal(j5.characters[0].titles[1], 'MNK');
+  assert.equal(j5.characters[0].palettes.length, 3);
+  console.log('PASS macro round-trip');
+
+  // apply=1 while logged in: the write is bracketed by client book
+  // switches (away -> write -> back + set page). Under fengari there is
+  // no coroutine.schedule, so the fallback runs the steps synchronously.
+  loggedIn = true;
+  const cmdsBefore = commands.length;
+  const out2 = Array.from({ length: 20 }, () => ({ name: '', lines: ['', '', '', '', '', ''] }));
+  out2[5] = { name: 'Live', lines: ['/ma Cure <me>', '', '', '', '', ''] };
+  const p6 = fetch(`${base}/api/macros/palette?apply=1`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ char: 'deadbee', index: 10, macros: out2 }),
+  }).then((r) => r.json());
+  await step(5);
+  const j6 = await p6;
+  assert.equal(j6.ok, true);
+  assert.equal(j6.applied, true);
+  assert.equal(j6.book, 2);
+  assert.equal(j6.palette, 1);
+  // book 2's "away" book is book 1; sequence away -> write -> back -> set
+  assert.deepEqual(commands.slice(cmdsBefore), [
+    'input /macro book 1',
+    'input /macro book 2',
+    'input /macro set 1',
+  ]);
+  const imgLive = readFileSync(join(macroDir, 'mcr10.dat'));
+  const rec5 = 28 + 5 * 380; // macro index 5
+  assert.equal(imgLive.subarray(rec5, rec5 + 20).toString('latin1').replace(/\0+$/, ''), '/ma Cure <me>');
+  assert.equal(
+    crypto.createHash('md5').update(imgLive.subarray(MD5_OFF)).digest('hex'),
+    imgLive.subarray(8, 24).toString('hex'),
+  );
+  loggedIn = false;
+  console.log('PASS apply (book-switch dance)');
 }
 
 // SSE: receive the initial snapshot event

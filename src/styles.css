@@ -54,6 +54,12 @@ body {
   color: var(--foreground);
 }
 
+/* fab mode: the overlay window is transparent — let it show through so
+   the square viewport reads as a circular button */
+body.fab-mode {
+  background-color: transparent;
+}
+
 .nav-link {
   opacity: 0.6;
   color: inherit;

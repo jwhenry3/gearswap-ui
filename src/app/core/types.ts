@@ -14,6 +14,8 @@ export interface BagItem {
   count: number;
   status: number;
   equipped: boolean;
+  /** /unequip slot name (main, l.ear, …) — set only when equipped */
+  equip_slot?: string;
   extdata?: string;
   augments?: Array<string | Record<string, unknown>>;
 }
@@ -70,4 +72,38 @@ export interface GearswapFileList {
 export interface GearswapFileContent {
   path: string;
   content: string;
+}
+
+// ---------- FFXI macro files (USER/<content id>/mcr*.dat) ----------
+
+export interface MacroEntry {
+  /** button label, max 8 bytes */
+  name: string;
+  /** up to 6 command lines, max 60 bytes each; "[AT:xxxxxxxx]" marks an
+   *  auto-translate phrase, "\xNN" a raw byte */
+  lines: string[];
+}
+
+export interface MacroPalette {
+  /** file index: mcr.dat = 0, mcrN.dat = N */
+  index: number;
+  file: string;
+  book: number; // 1-40
+  palette: number; // 1-10 within the book
+  macros: MacroEntry[];
+}
+
+export interface MacroCharacter {
+  /** content id — the USER/<id> folder name */
+  id: string;
+  /** book titles 1-40 (from mcr.ttl + mcr_2.ttl) */
+  titles: string[];
+  /** palettes that exist on disk; missing index = empty palette */
+  palettes: MacroPalette[];
+}
+
+export interface MacroState {
+  /** client is logged in — writes may be overwritten by the client on logout */
+  logged_in: boolean;
+  characters: MacroCharacter[];
 }

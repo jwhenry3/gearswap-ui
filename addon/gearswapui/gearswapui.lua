@@ -26,10 +26,15 @@ _addon.commands = { 'gsui', 'gearswapui' }
 local socket = require('socket')
 local res = require('resources')
 local config = require('config')
+local ok_macros, macrofs = pcall(require, 'macros')
+if not ok_macros then macrofs = nil end
 
 local defaults = {
     port = 17890,
     autostart = true,
+    -- auto-launch the floating overlay button on load; //gsui fab off
+    -- disables it (then use //gsui overlay to open manually)
+    fab = true,
     poll_interval = 1.5,
     swapui = {
         -- headless set scanner: custom[] holds sets added via `//gsui swap add`
@@ -339,6 +344,23 @@ local function collect_state()
     local ok_infos, infos_t = pcall(windower.ffxi.get_bag_info)
     if ok_infos and type(infos_t) == 'table' then bag_infos = infos_t end
 
+    -- items.equipment maps equip slot name -> {slot=<bag index>,
+    -- bag_id=<bag>}. Flatten to 'bag:index -> /unequip slot' so equipped
+    -- items can report which slot they occupy.
+    local EQUIP_CMD = {
+        lear = 'l.ear', rear = 'r.ear',
+        lring = 'l.ring', rring = 'r.ring',
+    }
+    local equip_slots = {}
+    if type(all_items) == 'table' and type(all_items.equipment) == 'table' then
+        for slot_name, eq in pairs(all_items.equipment) do
+            if type(eq) == 'table' and tonumber(eq.slot) then
+                local key = ('%.0f:%.0f'):format(tonumber(eq.bag_id) or 0, tonumber(eq.slot))
+                equip_slots[key] = EQUIP_CMD[slot_name] or slot_name
+            end
+        end
+    end
+
     for bag_id, bag_key in pairs(BAGS) do
         local items = all_items and (all_items[bag_key] or all_items[bag_id])
         local info = bag_infos and (bag_infos[bag_key] or bag_infos[bag_id])
@@ -367,6 +389,7 @@ local function collect_state()
                             count = entry.count,
                             status = entry.status,
                             equipped = entry.status == 5,
+                            equip_slot = equip_slots[('%.0f:%.0f'):format(bag_id, tonumber(entry.slot) or tonumber(slot) or -1)],
                             extdata = ext,
                         }
                         local augs = try_extdata(entry.id, ext)
@@ -756,6 +779,153 @@ routes['POST /api/item'] = function(conn, req)
     send_json(conn, 400, { error = 'unknown action' })
 end
 
+----------------------------------------------------------------------
+-- FFXI macro files (<ffxi>/USER/<content id>/mcr*.dat + mcr*.ttl)
+-- The client only guarantees reading these at login; while a character is
+-- logged in it may rewrite them from memory, so PUT responses carry a
+-- `logged_in` flag the UI turns into a warning.
+----------------------------------------------------------------------
+
+local function macro_logged_in()
+    local ok, info = pcall(windower.ffxi.get_info)
+    return ok and type(info) == 'table' and info.logged_in == true
+end
+
+local function macro_char_dir(char_id)
+    if type(char_id) ~= 'string' or not char_id:match('^[%w]+$')
+        or type(windower.ffxi_path) ~= 'string' then
+        return nil
+    end
+    local dir = join(join(windower.ffxi_path, 'USER'), char_id)
+    return windower.dir_exists(dir) and dir or nil
+end
+
+routes['GET /api/macros'] = function(conn)
+    if not macrofs then
+        return send_json(conn, 500, { error = 'macros module unavailable' })
+    end
+    local chars = {}
+    for _, d in ipairs(macrofs.find_char_dirs(windower.ffxi_path)) do
+        local pals = macrofs.read_palettes(d.path)
+        for _, p in ipairs(pals) do
+            for _, m in ipairs(p.macros) do
+                m.lines = json_array(m.lines)
+            end
+            p.macros = json_array(p.macros)
+        end
+        chars[#chars + 1] = {
+            id = d.id,
+            titles = json_array(macrofs.read_titles(d.path)),
+            palettes = json_array(pals),
+        }
+    end
+    send_json(conn, 200, {
+        logged_in = macro_logged_in(),
+        characters = json_array(chars),
+    })
+end
+
+-- Delay between client macro-book switches. PR #1892: loading a book twice
+-- in rapid succession can corrupt + wipe its files — pace commands at the
+-- client's own minimum delay.
+local MACRO_SWITCH_DELAY = 1.5
+local macro_schedule = coroutine.schedule or function(f) f() end
+
+-- body: {"char":"<content id>","index":<0-399>,
+--        "macros":[{"name":"x","lines":["/a",...x6]}, ... x20]}
+-- ?apply=1 (and logged in): force the client to re-read the book by
+-- switching away before writing, then switching back — the file lands
+-- while the book is unloaded so the stale in-memory copy can't clobber it.
+routes['PUT /api/macros/palette'] = function(conn, req)
+    if not macrofs then
+        return send_json(conn, 500, { error = 'macros module unavailable' })
+    end
+    local body = macrofs.json_decode(req.body or '')
+    if type(body) ~= 'table' then
+        return send_json(conn, 400, { error = 'invalid json' })
+    end
+    local dir = macro_char_dir(body.char)
+    local index = tonumber(body.index)
+    if not dir then
+        return send_json(conn, 400, { error = 'unknown character' })
+    end
+    if not index or index < 0 or index >= 400 or index % 1 ~= 0 then
+        return send_json(conn, 400, { error = 'bad palette index' })
+    end
+    if type(body.macros) ~= 'table' or #body.macros > 20 then
+        return send_json(conn, 400, { error = 'macros must be an array of up to 20' })
+    end
+
+    local apply = (req.query.apply == '1' or req.query.apply == 'true')
+        and macro_logged_in()
+    if apply then
+        -- Validate + build the image now so errors stay synchronous; the
+        -- bytes land in a scheduled step between book switches.
+        local image, path = macrofs.palette_image(dir, index, body.macros)
+        if not image then
+            return send_json(conn, 400, { error = tostring(path) })
+        end
+        local book = math.floor(index / 10) + 1
+        local page = index % 10 + 1
+        local other = book == 1 and 2 or 1
+        windower.send_command(('input /macro book %d'):format(other))
+        macro_schedule(function()
+            macrofs.commit_image(path, image)
+            macro_schedule(function()
+                windower.send_command(('input /macro book %d'):format(book))
+                macro_schedule(function()
+                    windower.send_command(('input /macro set %d'):format(page))
+                end, MACRO_SWITCH_DELAY)
+            end, MACRO_SWITCH_DELAY)
+        end, MACRO_SWITCH_DELAY)
+        return send_json(conn, 200, {
+            ok = true,
+            applied = true,
+            file = macrofs.palette_file(index),
+            book = book,
+            palette = page,
+            logged_in = true,
+        })
+    end
+
+    local ok, err = macrofs.write_palette(dir, index, body.macros)
+    if not ok then
+        return send_json(conn, 400, { error = tostring(err) })
+    end
+    send_json(conn, 200, {
+        ok = true,
+        file = macrofs.palette_file(index),
+        logged_in = macro_logged_in(),
+    })
+end
+
+-- body: {"char":"<content id>","book":<1-40>,"title":"RDM"}
+routes['PUT /api/macros/title'] = function(conn, req)
+    if not macrofs then
+        return send_json(conn, 500, { error = 'macros module unavailable' })
+    end
+    local body = macrofs.json_decode(req.body or '')
+    if type(body) ~= 'table' then
+        return send_json(conn, 400, { error = 'invalid json' })
+    end
+    local dir = macro_char_dir(body.char)
+    local book = tonumber(body.book)
+    if not dir then
+        return send_json(conn, 400, { error = 'unknown character' })
+    end
+    if not book or book < 1 or book > 40 or book % 1 ~= 0 then
+        return send_json(conn, 400, { error = 'book must be 1-40' })
+    end
+    if type(body.title) ~= 'string' then
+        return send_json(conn, 400, { error = 'missing title' })
+    end
+    local ok, err = macrofs.write_title(dir, book, body.title)
+    if not ok then
+        return send_json(conn, 400, { error = tostring(err) })
+    end
+    send_json(conn, 200, { ok = true, logged_in = macro_logged_in() })
+end
+
 -- Item icons: serve extracted .bmp files; decode the DAT on first request.
 -- item_by_id() coroutine.yield()s mid-write, so we drive it in a coroutine.
 routes['GET /api/icon'] = function(conn, req)
@@ -1022,34 +1192,53 @@ windower.register_event('prerender', pump)
 windower.register_event('time change', pump)
 windower.register_event('incoming chunk', pump)
 
+-- spawn the overlay shell. fab=true launches the collapsed floating
+-- button (bundled exe only — no Electron fallback, it's too heavy to
+-- auto-spawn). Returns true if something was launched.
+local function launch_overlay(fab)
+    local exe = windower.addon_path .. 'overlay\\gsui-overlay.exe'
+    if windower.file_exists(exe) then
+        os.execute('start "" "' .. exe .. '"' .. (fab and ' --fab' or ''))
+        return true
+    end
+    if fab then return false end
+    -- dev build: Electron via the repo sibling (needs node + npm i);
+    -- launch.mjs scrubs ELECTRON_RUN_AS_NODE from the inherited env
+    local script = windower.addon_path ..
+        '..\\..\\gearswapui\\overlay\\launch.mjs'
+    if windower.file_exists(script) then
+        os.execute('start "" node "' .. script .. '"')
+        return true
+    end
+    log_err('no overlay found (expected ' .. exe .. ')')
+    return false
+end
+
 windower.register_event('addon command', function(cmd, ...)
     cmd = (cmd or ''):lower()
     local args = { ... }
 
     if cmd == '' or cmd == 'help' then
-        log('commands: open | overlay | start | stop | status | port <n> | refresh | swap | equip <set>')
+        log('commands: open | overlay | fab | start | stop | status | port <n> | refresh | swap | equip <set>')
     elseif cmd == 'open' then
         if server or start_server() then
             windower.open_url('http://127.0.0.1:' .. bound_port .. '/')
         end
     elseif cmd == 'overlay' then
         if not (server or start_server()) then return end
-        -- distributed build: standalone Wails/WebView2 shell in the addon dir
-        local exe = windower.addon_path .. 'overlay\\gsui-overlay.exe'
-        if windower.file_exists(exe) then
-            os.execute('start "" "' .. exe .. '"')
+        if launch_overlay(false) then
             log('overlay launched')
-            return
         end
-        -- dev build: Electron via the repo sibling (needs node + npm i);
-        -- launch.mjs scrubs ELECTRON_RUN_AS_NODE from the inherited env
-        local script = windower.addon_path ..
-            '..\\..\\gearswapui\\overlay\\launch.mjs'
-        if windower.file_exists(script) then
-            os.execute('start "" node "' .. script .. '"')
-            log('overlay launched (electron dev)')
-        else
-            log_err('no overlay found (expected ' .. exe .. ')')
+    elseif cmd == 'fab' then
+        local sub = (args[1] or ''):lower()
+        if sub == 'on' or sub == 'off' then
+            settings.fab = (sub == 'on')
+            config.save(settings)
+            log('auto-fab ' .. (settings.fab and 'enabled' or 'disabled'))
+        elseif not (server or start_server()) then
+            return
+        elseif launch_overlay(true) then
+            log('fab launched')
         end
     elseif cmd == 'start' then
         start_server()
@@ -1127,6 +1316,11 @@ windower.register_event('load', 'login', function()
     if settings.autostart and not server then
         start_server()
     end
+    -- the floating button is always present while the addon is loaded —
+    -- on reload the running instance ignores --fab and just stays visible
+    if settings.fab and server then
+        launch_overlay(true)
+    end
     pending_state = nil
     last_state_json = nil
     last_job_id = nil
@@ -1136,6 +1330,8 @@ end)
 windower.register_event('unload', function()
     stop_server()
     if swapui then pcall(swapui.destroy) end
+    -- take the overlay down with the addon — the fab is part of it
+    os.execute('taskkill /F /IM gsui-overlay.exe >nul 2>nul')
 end)
 
 if settings.autostart then

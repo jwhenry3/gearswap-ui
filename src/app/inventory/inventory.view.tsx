@@ -269,6 +269,11 @@ export class InventoryView extends View {
     void this.itemCmd(`input /equip ${equipCmdSlot(slot)} ${cmdStr(name)}`, `/equip ${equipCmdSlot(slot)} ${name}`);
   }
 
+  private unequipItem(item: BagItem) {
+    if (!item.equip_slot) return;
+    void this.itemCmd(`input /unequip ${item.equip_slot}`, `/unequip ${item.equip_slot}`);
+  }
+
   private useItem(item: BagItem, meta?: ItemMeta) {
     const name = meta?.name ?? `item ${item.id}`;
     void this.itemCmd(`input /item ${cmdStr(name)} <me>`, `/item ${name} <me>`);
@@ -334,7 +339,7 @@ export class InventoryView extends View {
               {[meta?.rare && 'Rare', meta?.ex && 'Ex'].filter(Boolean).join(', ') || '—'}
             </dd>
           </div>
-          {item.status !== 0 && <div><dt class="inline text-slate-500">Status: </dt><dd class="inline">{item.status}{item.equipped ? ' (equipped)' : ''}</dd></div>}
+          {item.status !== 0 && <div><dt class="inline text-slate-500">Status: </dt><dd class="inline">{item.status}{item.equipped ? ` (equipped${item.equip_slot ? `: ${item.equip_slot}` : ''})` : ''}</dd></div>}
           {elsewhere.length > 0 && <div><dt class="inline text-slate-500">Duplicates: </dt><dd class="inline">{elsewhere.join(', ')}</dd></div>}
         </dl>
         {/* actions — same ops as the native inventory item menu */}
@@ -343,14 +348,20 @@ export class InventoryView extends View {
             (b) => b.enabled !== false && b.id !== bag.id,
           );
           const canEquip = !item.equipped && (meta?.slots?.length ?? 0) > 0;
+          const canUnequip = item.equipped && !!item.equip_slot;
           const canUse = meta?.category === 'Usable';
           const canDrop = bag.id === 0 && !item.equipped && !meta?.ex;
-          if (!canEquip && !canUse && moveTargets.length === 0 && !canDrop) return null;
+          if (!canEquip && !canUnequip && !canUse && moveTargets.length === 0 && !canDrop) return null;
           return (
             <div class="mt-3 flex flex-wrap items-center gap-1.5 border-t border-slate-800 pt-3">
               {canEquip && (
                 <Button size="xs" variant="secondary" onClick={() => this.equipItem(item, meta)}>
                   equip
+                </Button>
+              )}
+              {canUnequip && (
+                <Button size="xs" variant="secondary" onClick={() => this.unequipItem(item)}>
+                  unequip
                 </Button>
               )}
               {canUse && (
