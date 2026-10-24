@@ -1,0 +1,66 @@
+name: release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag, e.g. v0.2.0'
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: overlay/wails/go.mod
+          cache-dependency-path: overlay/wails/go.sum
+
+      - run: npm ci
+      - run: npm run build:addon
+      - run: npm run build:overlay
+      - run: node scripts/smoke-test.mjs
+
+      - name: Resolve tag/version
+        id: v
+        shell: pwsh
+        env:
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          $tag = $env:TAG
+          if (-not $tag.StartsWith('v')) { $tag = "v$tag" }
+          "tag=$tag" >> $env:GITHUB_OUTPUT
+          "version=$($tag.Substring(1))" >> $env:GITHUB_OUTPUT
+
+      - name: Package addon zip
+        run: node scripts/package.mjs
+        env:
+          GSUI_VERSION: ${{ steps.v.outputs.version }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gearswapui-${{ steps.v.outputs.version }}
+          path: dist/gearswapui-${{ steps.v.outputs.version }}.zip
+          retention-days: 30
+
+      - name: GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.v.outputs.tag }}
+          name: GearSwap UI ${{ steps.v.outputs.tag }}
+          files: dist/gearswapui-${{ steps.v.outputs.version }}.zip
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

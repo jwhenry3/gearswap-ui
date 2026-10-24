@@ -9,9 +9,11 @@ import { fileURLToPath } from 'node:url';
 const here = path.dirname(fileURLToPath(import.meta.url));
 const root = path.join(here, '..');
 const src = path.join(root, 'addon', 'gearswapui');
-const version = JSON.parse(
-  readFileSync(path.join(root, 'package.json'), 'utf8'),
-).version;
+// GSUI_VERSION lets CI name the zip after the git tag instead of the
+// package.json version (which may lag behind tags).
+const version =
+  process.env.GSUI_VERSION ||
+  JSON.parse(readFileSync(path.join(root, 'package.json'), 'utf8')).version;
 const zip = path.join(root, 'dist', `gearswapui-${version}.zip`);
 
 for (const [what, p] of [
